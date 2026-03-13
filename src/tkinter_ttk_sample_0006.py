@@ -1,4 +1,8 @@
+import io
+import os
+import tempfile
 import tkinter as tk
+from datetime import datetime
 from tkinter import messagebox, ttk
 
 try:
@@ -15,17 +19,90 @@ except ImportError:
     TkinterDnD = None
 
 
+MAX_API_FILE_SIZE = 10 * 1024 * 1024
+THUMBNAIL_SIZE = (800, 480)
+
+
 def show_input_text(entry: tk.Entry, has_image: bool) -> None:
     text = entry.get()
     image_status = "あり" if has_image else "なし"
     messagebox.showinfo("入力内容", f"文字列: {text}\n画像: {image_status}")
 
 
+def create_temp_file_path(extension: str) -> str:
+    temp_dir = tempfile.gettempdir()
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base_name = f"img_{timestamp}"
+    first_path = os.path.join(temp_dir, f"{base_name}.{extension}")
+    if not os.path.exists(first_path):
+        return first_path
+
+    index = 1
+    while True:
+        candidate = os.path.join(temp_dir, f"{base_name}_{index:02d}.{extension}")
+        if not os.path.exists(candidate):
+            return candidate
+        index += 1
+
+
+def save_original_temp_image(image: Image.Image, temp_files: set[str]) -> str:
+    temp_path = create_temp_file_path("png")
+    image.save(temp_path, format="PNG")
+    temp_files.add(temp_path)
+    return temp_path
+
+
+def save_api_send_image(original_temp_path: str, temp_files: set[str]) -> str:
+    if os.path.getsize(original_temp_path) <= MAX_API_FILE_SIZE:
+        return original_temp_path
+
+    if Image is None:
+        return original_temp_path
+
+    with Image.open(original_temp_path) as original:
+        work = original.convert("RGB")
+
+    quality = 95
+    while True:
+        buffer = io.BytesIO()
+        work.save(buffer, format="JPEG", quality=quality, optimize=True)
+        data = buffer.getvalue()
+
+        if len(data) <= MAX_API_FILE_SIZE:
+            temp_path = create_temp_file_path("jpg")
+            with open(temp_path, "wb") as temp_file:
+                temp_file.write(data)
+            temp_files.add(temp_path)
+            return temp_path
+
+        if quality > 35:
+            quality -= 10
+            continue
+
+        width, height = work.size
+        if max(width, height) <= 640:
+            temp_path = create_temp_file_path("jpg")
+            with open(temp_path, "wb") as temp_file:
+                temp_file.write(data)
+            temp_files.add(temp_path)
+            return temp_path
+
+        scale = 0.8
+        resized = (max(1, int(width * scale)), max(1, int(height * scale)))
+        work = work.resize(resized, Image.LANCZOS)
+        quality = 90
+
+
 def make_snapshot(current_image: dict) -> dict:
     image = current_image["pil"]
     if image is None:
-        return {"image": None}
-    return {"image": image.copy()}
+        return {"image": None, "original_temp_path": None, "api_send_path": None}
+
+    return {
+        "image": image.copy(),
+        "original_temp_path": current_image["original_temp_path"],
+        "api_send_path": current_image["api_send_path"],
+    }
 
 
 def apply_snapshot(
@@ -42,6 +119,8 @@ def apply_snapshot(
         close_button.place_forget()
         state["has_image"] = False
         current_image["pil"] = None
+        current_image["original_temp_path"] = None
+        current_image["api_send_path"] = None
         return
 
     tk_image = ImageTk.PhotoImage(image)
@@ -50,6 +129,8 @@ def apply_snapshot(
     close_button.place(relx=1.0, rely=0.0, anchor="ne")
     state["has_image"] = True
     current_image["pil"] = image.copy()
+    current_image["original_temp_path"] = snapshot["original_temp_path"]
+    current_image["api_send_path"] = snapshot["api_send_path"]
 
 
 def clear_thumbnail(
@@ -62,7 +143,7 @@ def clear_thumbnail(
     history["undo"].append(make_snapshot(current_image))
     history["redo"].clear()
     apply_snapshot(
-        {"image": None},
+        {"image": None, "original_temp_path": None, "api_send_path": None},
         image_label,
         close_button,
         state,
@@ -77,6 +158,7 @@ def handle_paste_image(
     state: dict,
     current_image: dict,
     history: dict,
+    temp_files: set[str],
 ) -> str:
     if ImageGrab is None or ImageTk is None or Image is None:
         messagebox.showinfo("情報", "Pillow が必要です（Pillowあり: サムネイル化される）。")
@@ -87,10 +169,18 @@ def handle_paste_image(
         history["undo"].append(make_snapshot(current_image))
         history["redo"].clear()
 
-        image = clipboard_data.copy()
-        image.thumbnail((800, 480))
+        original = clipboard_data.copy()
+        original_temp_path = save_original_temp_image(original, temp_files)
+        api_send_path = save_api_send_image(original_temp_path, temp_files)
+
+        preview = original.copy()
+        preview.thumbnail(THUMBNAIL_SIZE)
         apply_snapshot(
-            {"image": image},
+            {
+                "image": preview,
+                "original_temp_path": original_temp_path,
+                "api_send_path": api_send_path,
+            },
             image_label,
             close_button,
             state,
@@ -110,6 +200,7 @@ def handle_drop_image_file(
     state: dict,
     current_image: dict,
     history: dict,
+    temp_files: set[str],
 ) -> str:
     if Image is None or ImageTk is None:
         messagebox.showinfo("情報", "画像のドラッグ＆ドロップには Pillow が必要です。")
@@ -121,16 +212,26 @@ def handle_drop_image_file(
 
     image_path = drop_files[0]
     try:
-        image = Image.open(image_path)
-        image.thumbnail((800, 480))
+        with Image.open(image_path) as loaded:
+            original = loaded.copy()
     except Exception:
         messagebox.showinfo("情報", "画像ファイルを読み込めませんでした。")
         return "break"
 
     history["undo"].append(make_snapshot(current_image))
     history["redo"].clear()
+
+    original_temp_path = save_original_temp_image(original, temp_files)
+    api_send_path = save_api_send_image(original_temp_path, temp_files)
+
+    preview = original.copy()
+    preview.thumbnail(THUMBNAIL_SIZE)
     apply_snapshot(
-        {"image": image.copy()},
+        {
+            "image": preview,
+            "original_temp_path": original_temp_path,
+            "api_send_path": api_send_path,
+        },
         image_label,
         close_button,
         state,
@@ -173,6 +274,16 @@ def redo_thumbnail(
     return "break"
 
 
+def cleanup_temp_files(root: tk.Tk, temp_files: set[str]) -> None:
+    for file_path in list(temp_files):
+        try:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+        except OSError:
+            pass
+    root.destroy()
+
+
 def main() -> None:
     if TkinterDnD is not None:
         root = TkinterDnD.Tk()
@@ -206,8 +317,13 @@ def main() -> None:
     image_label.pack()
 
     state = {"has_image": False}
-    current_image = {"pil": None}
+    current_image = {
+        "pil": None,
+        "original_temp_path": None,
+        "api_send_path": None,
+    }
     history = {"undo": [], "redo": []}
+    temp_files: set[str] = set()
 
     close_button = tk.Button(
         thumbnail_frame,
@@ -238,6 +354,7 @@ def main() -> None:
                 state,
                 current_image,
                 history,
+                temp_files,
             ),
         )
 
@@ -250,6 +367,7 @@ def main() -> None:
             state,
             current_image,
             history,
+            temp_files,
         ),
     )
     root.bind(
@@ -261,6 +379,7 @@ def main() -> None:
             state,
             current_image,
             history,
+            temp_files,
         ),
     )
     root.bind(
@@ -318,6 +437,8 @@ def main() -> None:
             history,
         ),
     )
+
+    root.protocol("WM_DELETE_WINDOW", lambda: cleanup_temp_files(root, temp_files))
 
     tk_button = tk.Button(
         frame,
