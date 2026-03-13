@@ -15,11 +15,53 @@ def show_input_text(entry: tk.Entry, has_image: bool) -> None:
     messagebox.showinfo("入力内容", f"文字列: {text}\n画像: {image_status}")
 
 
-def clear_thumbnail(image_label: tk.Label, close_button: tk.Button, state: dict) -> None:
-    image_label.configure(image="", text="画像なし（Ctrl+Vで貼り付け）")
-    image_label.image = None
-    close_button.place_forget()
-    state["has_image"] = False
+def make_snapshot(current_image: dict) -> dict:
+    image = current_image["pil"]
+    if image is None:
+        return {"image": None}
+    return {"image": image.copy()}
+
+
+def apply_snapshot(
+    snapshot: dict,
+    image_label: tk.Label,
+    close_button: tk.Button,
+    state: dict,
+    current_image: dict,
+) -> None:
+    image = snapshot["image"]
+    if image is None or ImageTk is None:
+        image_label.configure(image="", text="画像なし（Ctrl+Vで貼り付け）")
+        image_label.image = None
+        close_button.place_forget()
+        state["has_image"] = False
+        current_image["pil"] = None
+        return
+
+    tk_image = ImageTk.PhotoImage(image)
+    image_label.configure(image=tk_image, text="")
+    image_label.image = tk_image
+    close_button.place(relx=1.0, rely=0.0, anchor="ne")
+    state["has_image"] = True
+    current_image["pil"] = image.copy()
+
+
+def clear_thumbnail(
+    image_label: tk.Label,
+    close_button: tk.Button,
+    state: dict,
+    current_image: dict,
+    history: dict,
+) -> None:
+    history["undo"].append(make_snapshot(current_image))
+    history["redo"].clear()
+    apply_snapshot(
+        {"image": None},
+        image_label,
+        close_button,
+        state,
+        current_image,
+    )
 
 
 def handle_paste_image(
@@ -27,6 +69,8 @@ def handle_paste_image(
     image_label: tk.Label,
     close_button: tk.Button,
     state: dict,
+    current_image: dict,
+    history: dict,
 ) -> str:
     if ImageGrab is None or ImageTk is None or Image is None:
         messagebox.showinfo("情報", "Pillow が必要です（Pillowあり: サムネイル化される）。")
@@ -34,17 +78,55 @@ def handle_paste_image(
 
     clipboard_data = ImageGrab.grabclipboard()
     if isinstance(clipboard_data, Image.Image):
+        history["undo"].append(make_snapshot(current_image))
+        history["redo"].clear()
+
         image = clipboard_data.copy()
         image.thumbnail((800, 480))
-        tk_image = ImageTk.PhotoImage(image)
-
-        image_label.configure(image=tk_image, text="")
-        image_label.image = tk_image
-        close_button.place(relx=1.0, rely=0.0, anchor="ne")
-        state["has_image"] = True
+        apply_snapshot(
+            {"image": image},
+            image_label,
+            close_button,
+            state,
+            current_image,
+        )
         return "break"
 
     messagebox.showinfo("情報", "クリップボードに画像がありません。")
+    return "break"
+
+
+def undo_thumbnail(
+    event: tk.Event,
+    image_label: tk.Label,
+    close_button: tk.Button,
+    state: dict,
+    current_image: dict,
+    history: dict,
+) -> str:
+    if not history["undo"]:
+        return "break"
+
+    history["redo"].append(make_snapshot(current_image))
+    snapshot = history["undo"].pop()
+    apply_snapshot(snapshot, image_label, close_button, state, current_image)
+    return "break"
+
+
+def redo_thumbnail(
+    event: tk.Event,
+    image_label: tk.Label,
+    close_button: tk.Button,
+    state: dict,
+    current_image: dict,
+    history: dict,
+) -> str:
+    if not history["redo"]:
+        return "break"
+
+    history["undo"].append(make_snapshot(current_image))
+    snapshot = history["redo"].pop()
+    apply_snapshot(snapshot, image_label, close_button, state, current_image)
     return "break"
 
 
@@ -77,11 +159,19 @@ def main() -> None:
     image_label.pack()
 
     state = {"has_image": False}
+    current_image = {"pil": None}
+    history = {"undo": [], "redo": []}
 
     close_button = tk.Button(
         thumbnail_frame,
         text="×",
-        command=lambda: clear_thumbnail(image_label, close_button, state),
+        command=lambda: clear_thumbnail(
+            image_label,
+            close_button,
+            state,
+            current_image,
+            history,
+        ),
         padx=4,
         pady=0,
     )
@@ -91,11 +181,80 @@ def main() -> None:
 
     root.bind(
         "<Control-v>",
-        lambda event: handle_paste_image(event, image_label, close_button, state),
+        lambda event: handle_paste_image(
+            event,
+            image_label,
+            close_button,
+            state,
+            current_image,
+            history,
+        ),
     )
     root.bind(
         "<Control-V>",
-        lambda event: handle_paste_image(event, image_label, close_button, state),
+        lambda event: handle_paste_image(
+            event,
+            image_label,
+            close_button,
+            state,
+            current_image,
+            history,
+        ),
+    )
+    root.bind(
+        "<Control-z>",
+        lambda event: undo_thumbnail(
+            event,
+            image_label,
+            close_button,
+            state,
+            current_image,
+            history,
+        ),
+    )
+    root.bind(
+        "<Control-Z>",
+        lambda event: undo_thumbnail(
+            event,
+            image_label,
+            close_button,
+            state,
+            current_image,
+            history,
+        ),
+    )
+    root.bind(
+        "<Control-y>",
+        lambda event: redo_thumbnail(
+            event,
+            image_label,
+            close_button,
+            state,
+            current_image,
+            history,
+        ),
+    )
+    root.bind(
+        "<Control-Y>",
+        lambda event: redo_thumbnail(
+            event,
+            image_label,
+            close_button,
+            state,
+            current_image,
+            history,
+        ),
+    )
+    root.bind(
+        "<Control-Shift-Z>",
+        lambda event: redo_thumbnail(
+            event,
+            image_label,
+            close_button,
+            state,
+            current_image,
+            history,
+        ),
     )
 
     tk_button = tk.Button(
