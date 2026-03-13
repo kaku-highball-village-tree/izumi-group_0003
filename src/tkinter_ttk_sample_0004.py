@@ -35,7 +35,7 @@ def handle_paste_image(
     clipboard_data = ImageGrab.grabclipboard()
     if isinstance(clipboard_data, Image.Image):
         image = clipboard_data.copy()
-        image.thumbnail((320, 180))
+        image.thumbnail((400, 240))
         tk_image = ImageTk.PhotoImage(image)
 
         image_label.configure(image=tk_image, text="")
