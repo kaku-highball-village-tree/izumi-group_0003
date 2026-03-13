@@ -72,9 +72,7 @@ def main() -> None:
     image_label = tk.Label(
         thumbnail_frame,
         text="画像なし（Ctrl+Vで貼り付け）",
-        width=40,
-        height=10,
-        anchor="center",
+        anchor="nw",
     )
     image_label.pack()
 
