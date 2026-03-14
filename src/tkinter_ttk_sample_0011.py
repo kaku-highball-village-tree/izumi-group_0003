@@ -42,7 +42,7 @@ def open_original_temp_with_paint(current_image: dict) -> None:
 def create_audio_temp_file_path() -> str:
     temp_dir = tempfile.gettempdir()
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    base_name = f"img_{timestamp}"
+    base_name = f"voice_{timestamp}"
     first_path = os.path.join(temp_dir, f"{base_name}.wav")
     if not os.path.exists(first_path):
         return first_path
