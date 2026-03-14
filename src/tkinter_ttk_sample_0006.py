@@ -20,7 +20,7 @@ except ImportError:
 
 
 MAX_API_FILE_SIZE = 10 * 1024 * 1024
-THUMBNAIL_SIZE = (800, 480)
+THUMBNAIL_SIZE = (400, 240)
 
 
 def show_input_text(entry: tk.Entry, has_image: bool) -> None:
