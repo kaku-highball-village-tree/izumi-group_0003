@@ -41,7 +41,7 @@ def open_original_temp_with_paint(current_image: dict) -> None:
 def on_mic_button_click(mic_button: tk.Button, mic_state: dict) -> None:
     mic_state["is_recording"] = not mic_state["is_recording"]
     if mic_state["is_recording"]:
-        mic_button.configure(text="●録音中")
+        mic_button.configure(text="🔴録音中")
     else:
         mic_button.configure(text="🎤")
 
