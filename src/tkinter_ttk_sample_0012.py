@@ -1,3 +1,4 @@
+import audioop
 import ctypes
 import io
 import json
@@ -99,10 +100,10 @@ def transcribe_wav_with_vosk(wav_path: str) -> tuple[str | None, str | None]:
             sample_width = wav_file.getsampwidth()
             frame_rate = wav_file.getframerate()
 
-            if channels != 1:
-                return None, "wav はモノラル（1ch）である必要があります。"
-            if sample_width != 2:
-                return None, "wav は 16bit PCM である必要があります。"
+            if channels < 1:
+                return None, "wav のチャンネル数が不正です。"
+            if sample_width not in (1, 2, 3, 4):
+                return None, "対応外の wav 形式です。"
 
             model = Model(model_path)
             recognizer = KaldiRecognizer(model, frame_rate)
@@ -114,7 +115,18 @@ def transcribe_wav_with_vosk(wav_path: str) -> tuple[str | None, str | None]:
                 if not chunk:
                     break
 
-                if recognizer.AcceptWaveform(chunk):
+                # Vosk が扱いやすい 16bit PCM / モノラルへ変換する
+                pcm_chunk = chunk
+                if channels > 1:
+                    pcm_chunk = audioop.tomono(pcm_chunk, sample_width, 0.5, 0.5)
+                if sample_width == 1:
+                    # 8bit PCM は符号なしのため、符号付きへ寄せてから 16bit 化
+                    pcm_chunk = audioop.bias(pcm_chunk, 1, -128)
+                    pcm_chunk = audioop.lin2lin(pcm_chunk, 1, 2)
+                elif sample_width != 2:
+                    pcm_chunk = audioop.lin2lin(pcm_chunk, sample_width, 2)
+
+                if recognizer.AcceptWaveform(pcm_chunk):
                     result = json.loads(recognizer.Result())
                     text = result.get("text", "").strip()
                     if text:
