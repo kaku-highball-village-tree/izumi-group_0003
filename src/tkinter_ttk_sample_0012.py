@@ -1,4 +1,3 @@
-import audioop
 import ctypes
 import io
 import json
@@ -29,6 +28,10 @@ except ImportError:
     KaldiRecognizer = None
     Model = None
 
+try:
+    import numpy as np
+except ImportError:
+    np = None
 
 MAX_API_FILE_SIZE = 10 * 1024 * 1024
 THUMBNAIL_SIZE = (400, 240)
@@ -93,6 +96,9 @@ def transcribe_wav_with_vosk(wav_path: str) -> tuple[str | None, str | None]:
     if not os.path.exists(wav_path):
         return None, "wav ファイルが見つかりません。"
 
+    if np is None:
+        return None, "NumPy が見つかりません。`pip install numpy` を実行してください。"
+
     # wav 読み込みとフォーマットチェック
     try:
         with wave.open(wav_path, "rb") as wav_file:
@@ -115,16 +121,34 @@ def transcribe_wav_with_vosk(wav_path: str) -> tuple[str | None, str | None]:
                 if not chunk:
                     break
 
-                # Vosk が扱いやすい 16bit PCM / モノラルへ変換する
-                pcm_chunk = chunk
-                if channels > 1:
-                    pcm_chunk = audioop.tomono(pcm_chunk, sample_width, 0.5, 0.5)
+                # Vosk が扱いやすい 16bit PCM / モノラルへ変換する（NumPy版）
                 if sample_width == 1:
-                    # 8bit PCM は符号なしのため、符号付きへ寄せてから 16bit 化
-                    pcm_chunk = audioop.bias(pcm_chunk, 1, -128)
-                    pcm_chunk = audioop.lin2lin(pcm_chunk, 1, 2)
-                elif sample_width != 2:
-                    pcm_chunk = audioop.lin2lin(pcm_chunk, sample_width, 2)
+                    samples = np.frombuffer(chunk, dtype=np.uint8).astype(np.int16)
+                    samples = (samples - 128) << 8
+                elif sample_width == 2:
+                    samples = np.frombuffer(chunk, dtype='<i2').astype(np.int16)
+                elif sample_width == 3:
+                    raw = np.frombuffer(chunk, dtype=np.uint8)
+                    if len(raw) % 3 != 0:
+                        return None, "wav の読み込みに失敗しました。"
+                    raw = raw.reshape(-1, 3)
+                    values = (
+                        raw[:, 0].astype(np.int32)
+                        | (raw[:, 1].astype(np.int32) << 8)
+                        | (raw[:, 2].astype(np.int32) << 16)
+                    )
+                    values = np.where(values & 0x800000, values - 0x1000000, values)
+                    samples = (values >> 8).astype(np.int16)
+                else:  # sample_width == 4
+                    values = np.frombuffer(chunk, dtype='<i4')
+                    samples = (values >> 16).astype(np.int16)
+
+                if channels > 1:
+                    if len(samples) % channels != 0:
+                        return None, "wav の読み込みに失敗しました。"
+                    samples = samples.reshape(-1, channels).mean(axis=1).astype(np.int16)
+
+                pcm_chunk = samples.tobytes()
 
                 if recognizer.AcceptWaveform(pcm_chunk):
                     result = json.loads(recognizer.Result())
