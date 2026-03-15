@@ -1,9 +1,11 @@
 import ctypes
 import io
+import json
 import os
 import subprocess
 import tempfile
 import tkinter as tk
+import wave
 from datetime import datetime
 from tkinter import messagebox, ttk
 
@@ -19,6 +21,12 @@ try:
 except ImportError:
     DND_FILES = None
     TkinterDnD = None
+
+try:
+    from vosk import KaldiRecognizer, Model
+except ImportError:
+    KaldiRecognizer = None
+    Model = None
 
 
 MAX_API_FILE_SIZE = 10 * 1024 * 1024
@@ -64,6 +72,70 @@ def _close_recorder_if_open(mic_state: dict) -> None:
     _mci_send(f"close {alias}")
 
 
+def get_vosk_model_path() -> str:
+    # Pythonファイルの場所を基準に Vosk モデルのパスを解決する
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(script_dir, "vosk-model-small-ja-0.22")
+
+
+def transcribe_wav_with_vosk(wav_path: str) -> tuple[str | None, str | None]:
+    # ライブラリ未導入時
+    if Model is None or KaldiRecognizer is None:
+        return None, "Vosk ライブラリが見つかりません。"
+
+    # モデルフォルダ存在チェック
+    model_path = get_vosk_model_path()
+    if not os.path.isdir(model_path):
+        return None, "Vosk モデルフォルダが見つかりません。"
+
+    # 音声ファイル存在チェック
+    if not os.path.exists(wav_path):
+        return None, "wav ファイルが見つかりません。"
+
+    # wav 読み込みとフォーマットチェック
+    try:
+        with wave.open(wav_path, "rb") as wav_file:
+            channels = wav_file.getnchannels()
+            sample_width = wav_file.getsampwidth()
+            frame_rate = wav_file.getframerate()
+
+            if channels != 1:
+                return None, "wav はモノラル（1ch）である必要があります。"
+            if sample_width != 2:
+                return None, "wav は 16bit PCM である必要があります。"
+
+            model = Model(model_path)
+            recognizer = KaldiRecognizer(model, frame_rate)
+            recognizer.SetWords(True)
+
+            texts: list[str] = []
+            while True:
+                chunk = wav_file.readframes(4000)
+                if not chunk:
+                    break
+
+                if recognizer.AcceptWaveform(chunk):
+                    result = json.loads(recognizer.Result())
+                    text = result.get("text", "").strip()
+                    if text:
+                        texts.append(text)
+
+            final_result = json.loads(recognizer.FinalResult())
+            final_text = final_result.get("text", "").strip()
+            if final_text:
+                texts.append(final_text)
+    except wave.Error:
+        return None, "wav の読み込みに失敗しました。"
+    except Exception:
+        return None, "音声認識に失敗しました。"
+
+    recognized_text = " ".join(texts).strip()
+    if not recognized_text:
+        return None, "音声を認識できませんでした。"
+
+    return recognized_text, None
+
+
 def on_mic_button_click(mic_button: tk.Button, mic_state: dict, temp_files: set[str]) -> None:
     if os.name != "nt":
         messagebox.showinfo("録音", "録音機能は Windows のみ対応です。")
@@ -102,7 +174,18 @@ def on_mic_button_click(mic_button: tk.Button, mic_state: dict, temp_files: set[
     temp_files.add(audio_path)
     mic_state["last_audio_path"] = audio_path
     mic_state["is_recording"] = False
+
+    # 録音停止後に Vosk で文字起こし（第5段階: print + MessageBox まで）
+    mic_button.configure(text="変換中...", fg="black")
+    recognized_text, error_message = transcribe_wav_with_vosk(audio_path)
     mic_button.configure(text="🎤", fg="black")
+
+    if error_message is not None:
+        messagebox.showinfo("音声認識", error_message)
+        return
+
+    print(recognized_text)
+    messagebox.showinfo("音声認識結果", recognized_text)
 
 
 def create_temp_file_path(extension: str) -> str:
