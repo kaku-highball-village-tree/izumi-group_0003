@@ -151,6 +151,11 @@ def save_transcription_to_file(target_directory_path: str, transcribed_text: str
     return output_file_path
 
 
+def open_text_file_with_default_editor(file_path: str) -> None:
+    """保存したテキストファイルを標準エディターで開く。"""
+    os.startfile(file_path)
+
+
 def _mci_send(command: str) -> int:
     return ctypes.windll.winmm.mciSendStringW(command, None, 0, None)
 
@@ -252,6 +257,11 @@ def on_mic_button_click(mic_button: tk.Button, mic_state: dict, temp_files: set[
         '音声認識結果',
         f'{recognized_text}\n\n保存先: {saved_text_path}',
     )
+
+    try:
+        open_text_file_with_default_editor(saved_text_path)
+    except Exception as exc:
+        messagebox.showinfo('エディター起動失敗', f'保存したテキストファイルを開けませんでした。\n{exc}')
 
 
 def create_temp_file_path(extension: str) -> str:
