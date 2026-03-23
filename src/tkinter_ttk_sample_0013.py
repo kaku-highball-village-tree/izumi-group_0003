@@ -159,6 +159,34 @@ def open_text_file_with_default_editor(file_path: str) -> None:
     os.startfile(file_path)
 
 
+def create_bom_temp_file_from_text_file(source_file_path: str, temp_files: set[str]) -> str:
+    """表示専用の BOM 付き temp ファイルを作成する。"""
+    source_path = Path(source_file_path)
+    bom_file_name = f"bom_temp_{source_path.name}"
+    bom_file_path = source_path.with_name(bom_file_name)
+
+    with open(source_file_path, "r", encoding="utf-8") as source_file:
+        content = source_file.read()
+
+    with open(bom_file_path, "w", encoding="utf-8-sig") as bom_file:
+        bom_file.write(content)
+
+    temp_files.add(str(bom_file_path))
+    return str(bom_file_path)
+
+
+def open_text_file_with_notepad_and_delete_after_close(file_path: str, temp_files: set[str]) -> None:
+    """メモ帳で開き、閉じられたら BOM 付き temp ファイルを削除する。"""
+    process = subprocess.Popen(["notepad.exe", file_path])
+    process.wait()
+
+    if file_path in temp_files:
+        temp_files.discard(file_path)
+
+    if os.path.exists(file_path):
+        os.remove(file_path)
+
+
 def save_image_ocr_to_file(target_directory_path: str, recognized_text: str) -> str:
     """画像OCR結果を日時付きテキストファイルとして保存する。"""
     timestamp = datetime.now().strftime('%Y_%m_%d_%H_%M_%S')
@@ -362,7 +390,8 @@ def on_mic_button_click(mic_button: tk.Button, mic_state: dict, temp_files: set[
     )
 
     try:
-        open_text_file_with_default_editor(saved_text_path)
+        bom_temp_file_path = create_bom_temp_file_from_text_file(saved_text_path, temp_files)
+        open_text_file_with_notepad_and_delete_after_close(bom_temp_file_path, temp_files)
     except Exception as exc:
         messagebox.showinfo('エディター起動失敗', f'保存したテキストファイルを開けませんでした。\n{exc}')
 
@@ -535,7 +564,8 @@ def run_image_ocr_flow(
     )
 
     try:
-        open_text_file_with_default_editor(saved_text_path)
+        bom_temp_file_path = create_bom_temp_file_from_text_file(saved_text_path, temp_files)
+        open_text_file_with_notepad_and_delete_after_close(bom_temp_file_path, temp_files)
     except Exception as exc:
         messagebox.showinfo("エディター起動失敗", f"保存したテキストファイルを開けませんでした。\n{exc}")
 
