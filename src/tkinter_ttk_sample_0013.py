@@ -1,3 +1,4 @@
+import base64
 import ctypes
 import io
 import os
@@ -28,6 +29,8 @@ except ImportError:
 
 MAX_API_FILE_SIZE = 10 * 1024 * 1024
 THUMBNAIL_SIZE = (400, 240)
+IMAGE_OCR_CONFIRM_TIMEOUT_MS = 10000
+IMAGE_OCR_MODEL = "gpt-4.1-mini"
 
 
 def open_original_temp_with_paint(current_image: dict) -> None:
@@ -154,6 +157,106 @@ def save_transcription_to_file(target_directory_path: str, transcribed_text: str
 def open_text_file_with_default_editor(file_path: str) -> None:
     """保存したテキストファイルを標準エディターで開く。"""
     os.startfile(file_path)
+
+
+def save_image_ocr_to_file(target_directory_path: str, recognized_text: str) -> str:
+    """画像OCR結果を日時付きテキストファイルとして保存する。"""
+    timestamp = datetime.now().strftime('%Y_%m_%d_%H_%M_%S')
+    output_file_name = f'output_image_string_{timestamp}.txt'
+    output_file_path = os.path.join(target_directory_path, output_file_name)
+
+    with open(output_file_path, 'w', encoding='utf-8') as text_file:
+        text_file.write(recognized_text)
+        text_file.write('\n')
+
+    return output_file_path
+
+
+def _encode_image_file_as_data_url(image_file_path: str) -> str:
+    image_path = Path(image_file_path)
+    suffix = image_path.suffix.lower()
+    mime_type_map = {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".webp": "image/webp",
+        ".gif": "image/gif",
+    }
+    mime_type = mime_type_map.get(suffix, "application/octet-stream")
+
+    with open(image_file_path, "rb") as image_file:
+        encoded = base64.b64encode(image_file.read()).decode("ascii")
+
+    return f"data:{mime_type};base64,{encoded}"
+
+
+def extract_text_from_image_file(image_file_path: str, api_key: str) -> str:
+    """画像ファイルを OpenAI API に送信して OCR 結果文字列を返す。"""
+    client = OpenAI(api_key=api_key)
+    data_url = _encode_image_file_as_data_url(image_file_path)
+
+    response = client.responses.create(
+        model=IMAGE_OCR_MODEL,
+        input=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "画像内の文字をOCRしてください。読めた文字だけを自然な改行で返してください。",
+                    },
+                    {
+                        "type": "input_image",
+                        "image_url": data_url,
+                    },
+                ],
+            }
+        ],
+    )
+
+    return response.output_text.strip()
+
+
+def ask_image_ocr_confirmation(root: tk.Tk) -> str:
+    """画像OCRを実行するか確認し、yes/no/timeout を返す。"""
+    dialog = tk.Toplevel(root)
+    dialog.title("画像OCR確認")
+    dialog.transient(root)
+    dialog.grab_set()
+    dialog.resizable(False, False)
+
+    result = {"value": "timeout"}
+
+    frame = tk.Frame(dialog, padx=16, pady=16)
+    frame.pack()
+
+    tk.Label(
+        frame,
+        text="画像を ChatGPT に送って OCR を実行しますか？\nYes: 実行 / No: やり直し / 10秒放置: やり直し",
+        justify="left",
+    ).pack(pady=(0, 12))
+
+    button_row = tk.Frame(frame)
+    button_row.pack()
+
+    def close_dialog(value: str) -> None:
+        if dialog.winfo_exists():
+            result["value"] = value
+            dialog.destroy()
+
+    tk.Button(button_row, text="Yes", width=10, command=lambda: close_dialog("yes")).pack(side="left", padx=4)
+    tk.Button(button_row, text="No", width=10, command=lambda: close_dialog("no")).pack(side="left", padx=4)
+
+    dialog.protocol("WM_DELETE_WINDOW", lambda: close_dialog("no"))
+    dialog.after(IMAGE_OCR_CONFIRM_TIMEOUT_MS, lambda: close_dialog("timeout"))
+
+    dialog.update_idletasks()
+    pos_x = root.winfo_rootx() + max(0, (root.winfo_width() - dialog.winfo_width()) // 2)
+    pos_y = root.winfo_rooty() + max(0, (root.winfo_height() - dialog.winfo_height()) // 2)
+    dialog.geometry(f"+{pos_x}+{pos_y}")
+
+    root.wait_window(dialog)
+    return result["value"]
 
 
 def _mci_send(command: str) -> int:
@@ -386,8 +489,60 @@ def clear_thumbnail(
     )
 
 
+def run_image_ocr_flow(
+    root: tk.Tk,
+    image_label: tk.Label,
+    close_button: tk.Button,
+    state: dict,
+    current_image: dict,
+    history: dict,
+    temp_files: set[str],
+) -> None:
+    """現在の画像に対する OCR 実行可否を確認し、必要なら OCR を実行する。"""
+    confirm_result = ask_image_ocr_confirmation(root)
+    if confirm_result != "yes":
+        clear_thumbnail(image_label, close_button, state, current_image, history)
+        if confirm_result == "timeout":
+            messagebox.showinfo("画像OCR", "一定時間応答がなかったため、画像をクリアしました。")
+        return
+
+    api_send_path = current_image.get("api_send_path")
+    if not api_send_path:
+        messagebox.showinfo("画像OCR", "OCR に使用できる画像がありません。")
+        return
+
+    try:
+        api_key = load_api_key_from_encrypted_files()
+    except Exception as exc:
+        messagebox.showinfo("APIキー復号失敗", f"OpenAI API キーの復号に失敗しました。\n{exc}")
+        return
+
+    try:
+        recognized_text = extract_text_from_image_file(api_send_path, api_key)
+    except Exception as exc:
+        messagebox.showinfo("画像OCR失敗", f"画像の OCR に失敗しました。\n{exc}")
+        return
+
+    try:
+        saved_text_path = save_image_ocr_to_file(os.path.dirname(api_send_path), recognized_text)
+    except Exception as exc:
+        messagebox.showinfo("保存失敗", f"画像OCR結果の保存に失敗しました。\n{exc}")
+        return
+
+    messagebox.showinfo(
+        "画像OCR結果",
+        f"{recognized_text}\n\n保存先: {saved_text_path}",
+    )
+
+    try:
+        open_text_file_with_default_editor(saved_text_path)
+    except Exception as exc:
+        messagebox.showinfo("エディター起動失敗", f"保存したテキストファイルを開けませんでした。\n{exc}")
+
+
 def handle_paste_image(
     event: tk.Event,
+    root: tk.Tk,
     image_label: tk.Label,
     close_button: tk.Button,
     state: dict,
@@ -420,6 +575,15 @@ def handle_paste_image(
             close_button,
             state,
             current_image,
+        )
+        run_image_ocr_flow(
+            root,
+            image_label,
+            close_button,
+            state,
+            current_image,
+            history,
+            temp_files,
         )
         return "break"
 
@@ -471,6 +635,15 @@ def handle_drop_image_file(
         close_button,
         state,
         current_image,
+    )
+    run_image_ocr_flow(
+        root,
+        image_label,
+        close_button,
+        state,
+        current_image,
+        history,
+        temp_files,
     )
     return "break"
 
@@ -528,7 +701,7 @@ def main() -> None:
     else:
         root = tk.Tk()
 
-    root.title("tkinter / ttk Button Sample 0012")
+    root.title("tkinter / ttk Button Sample 0013")
 
     screen_width = root.winfo_screenwidth()
     screen_height = root.winfo_screenheight()
@@ -612,6 +785,7 @@ def main() -> None:
         "<Control-v>",
         lambda event: handle_paste_image(
             event,
+            root,
             image_label,
             close_button,
             state,
@@ -624,6 +798,7 @@ def main() -> None:
         "<Control-V>",
         lambda event: handle_paste_image(
             event,
+            root,
             image_label,
             close_button,
             state,
