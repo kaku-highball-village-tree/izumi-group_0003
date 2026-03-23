@@ -1,13 +1,16 @@
 import ctypes
 import io
-import json
 import os
+import shutil
 import subprocess
 import tempfile
 import tkinter as tk
-import wave
 from datetime import datetime
+from pathlib import Path
 from tkinter import messagebox, ttk
+
+from cryptography.fernet import Fernet
+from openai import OpenAI
 
 try:
     from PIL import Image, ImageGrab, ImageTk
@@ -22,16 +25,6 @@ except ImportError:
     DND_FILES = None
     TkinterDnD = None
 
-try:
-    from vosk import KaldiRecognizer, Model
-except ImportError:
-    KaldiRecognizer = None
-    Model = None
-
-try:
-    import numpy as np
-except ImportError:
-    np = None
 
 MAX_API_FILE_SIZE = 10 * 1024 * 1024
 THUMBNAIL_SIZE = (400, 240)
@@ -52,6 +45,7 @@ def open_original_temp_with_paint(current_image: dict) -> None:
 
 
 def create_audio_temp_file_path() -> str:
+    """録音用の一時 WAV ファイルパスを生成する。"""
     temp_dir = tempfile.gettempdir()
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     base_name = f"voice_{timestamp}"
@@ -67,6 +61,101 @@ def create_audio_temp_file_path() -> str:
         index += 1
 
 
+def create_mp3_temp_file_path_from_wav(wav_path: str) -> str:
+    """WAV と同じタイムスタンプを使った MP3 一時ファイルパスを返す。"""
+    wav_obj = Path(wav_path)
+    return str(wav_obj.with_suffix('.mp3'))
+
+
+def find_ffmpeg_executable_path() -> str | None:
+    """同じフォルダー、次に PATH 上から ffmpeg 実行ファイルを探す。"""
+    script_dir = Path(__file__).resolve().parent
+    local_ffmpeg_path = script_dir / "ffmpeg.exe"
+    if local_ffmpeg_path.exists():
+        return str(local_ffmpeg_path)
+
+    return shutil.which("ffmpeg")
+
+
+def load_api_key_from_encrypted_files() -> str:
+    """secret_key.bin と encrypted_key.bin から OpenAI API キーを復号する。"""
+    script_dir = Path(__file__).resolve().parent
+    candidate_directories = [
+        script_dir,
+        script_dir.parent,
+    ]
+    secret_key_path = None
+    encrypted_key_path = None
+
+    for base_dir in candidate_directories:
+        candidate_secret_key_path = base_dir / "key" / "secret_key.bin"
+        candidate_encrypted_key_path = base_dir / "ciphertext" / "encrypted_key.bin"
+        if candidate_secret_key_path.exists() and candidate_encrypted_key_path.exists():
+            secret_key_path = candidate_secret_key_path
+            encrypted_key_path = candidate_encrypted_key_path
+            break
+
+    if secret_key_path is None or encrypted_key_path is None:
+        raise FileNotFoundError("secret_key.bin または encrypted_key.bin が見つかりません。")
+
+    with open(secret_key_path, 'rb') as secret_key_file:
+        secret_key = secret_key_file.read()
+
+    cipher = Fernet(secret_key)
+
+    with open(encrypted_key_path, 'rb') as encrypted_key_file:
+        encrypted_token = encrypted_key_file.read()
+
+    return cipher.decrypt(encrypted_token).decode('utf-8')
+
+
+def convert_wav_to_mp3(wav_path: str, mp3_path: str, ffmpeg_path: str) -> None:
+    """ffmpeg を使って WAV を MP3 に変換する。"""
+    subprocess.run(
+        [
+            ffmpeg_path,
+            '-y',
+            '-i',
+            wav_path,
+            mp3_path,
+        ],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
+def transcribe_audio_file(audio_file_path: str, api_key: str) -> str:
+    """音声ファイルを OpenAI API に送信して文字起こし結果を返す。"""
+    client = OpenAI(api_key=api_key)
+
+    with open(audio_file_path, 'rb') as audio_file:
+        response = client.audio.transcriptions.create(
+            model='gpt-4o-mini-transcribe',
+            file=audio_file,
+        )
+
+    return response.text
+
+
+def save_transcription_to_file(target_directory_path: str, transcribed_text: str) -> str:
+    """文字起こし結果を日時付きテキストファイルとして保存する。"""
+    timestamp = datetime.now().strftime('%Y_%m_%d_%H_%M_%S')
+    output_file_name = f'output_voice_string_{timestamp}.txt'
+    output_file_path = os.path.join(target_directory_path, output_file_name)
+
+    with open(output_file_path, 'w', encoding='utf-8') as text_file:
+        text_file.write(transcribed_text)
+        text_file.write('\n')
+
+    return output_file_path
+
+
+def open_text_file_with_default_editor(file_path: str) -> None:
+    """保存したテキストファイルを標準エディターで開く。"""
+    os.startfile(file_path)
+
+
 def _mci_send(command: str) -> int:
     return ctypes.windll.winmm.mciSendStringW(command, None, 0, None)
 
@@ -76,152 +165,103 @@ def _close_recorder_if_open(mic_state: dict) -> None:
     _mci_send(f"close {alias}")
 
 
-def get_vosk_model_path() -> str:
-    # Pythonファイルの場所を基準に Vosk モデルのパスを解決する
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(script_dir, "vosk-model-small-ja-0.22")
-
-
-def transcribe_wav_with_vosk(wav_path: str) -> tuple[str | None, str | None]:
-    # ライブラリ未導入時
-    if Model is None or KaldiRecognizer is None:
-        return None, "Vosk ライブラリが見つかりません。"
-
-    # モデルフォルダ存在チェック
-    model_path = get_vosk_model_path()
-    if not os.path.isdir(model_path):
-        return None, "Vosk モデルフォルダが見つかりません。"
-
-    # 音声ファイル存在チェック
-    if not os.path.exists(wav_path):
-        return None, "wav ファイルが見つかりません。"
-
-    if np is None:
-        return None, "NumPy が見つかりません。`pip install numpy` を実行してください。"
-
-    # wav 読み込みとフォーマットチェック
-    try:
-        with wave.open(wav_path, "rb") as wav_file:
-            channels = wav_file.getnchannels()
-            sample_width = wav_file.getsampwidth()
-            frame_rate = wav_file.getframerate()
-
-            if channels < 1:
-                return None, "wav のチャンネル数が不正です。"
-            if sample_width not in (1, 2, 3, 4):
-                return None, "対応外の wav 形式です。"
-
-            model = Model(model_path)
-            recognizer = KaldiRecognizer(model, frame_rate)
-            recognizer.SetWords(True)
-
-            texts: list[str] = []
-            while True:
-                chunk = wav_file.readframes(4000)
-                if not chunk:
-                    break
-
-                # Vosk が扱いやすい 16bit PCM / モノラルへ変換する（NumPy版）
-                if sample_width == 1:
-                    samples = np.frombuffer(chunk, dtype=np.uint8).astype(np.int16)
-                    samples = (samples - 128) << 8
-                elif sample_width == 2:
-                    samples = np.frombuffer(chunk, dtype='<i2').astype(np.int16)
-                elif sample_width == 3:
-                    raw = np.frombuffer(chunk, dtype=np.uint8)
-                    if len(raw) % 3 != 0:
-                        return None, "wav の読み込みに失敗しました。"
-                    raw = raw.reshape(-1, 3)
-                    values = (
-                        raw[:, 0].astype(np.int32)
-                        | (raw[:, 1].astype(np.int32) << 8)
-                        | (raw[:, 2].astype(np.int32) << 16)
-                    )
-                    values = np.where(values & 0x800000, values - 0x1000000, values)
-                    samples = (values >> 8).astype(np.int16)
-                else:  # sample_width == 4
-                    values = np.frombuffer(chunk, dtype='<i4')
-                    samples = (values >> 16).astype(np.int16)
-
-                if channels > 1:
-                    if len(samples) % channels != 0:
-                        return None, "wav の読み込みに失敗しました。"
-                    samples = samples.reshape(-1, channels).mean(axis=1).astype(np.int16)
-
-                pcm_chunk = samples.tobytes()
-
-                if recognizer.AcceptWaveform(pcm_chunk):
-                    result = json.loads(recognizer.Result())
-                    text = result.get("text", "").strip()
-                    if text:
-                        texts.append(text)
-
-            final_result = json.loads(recognizer.FinalResult())
-            final_text = final_result.get("text", "").strip()
-            if final_text:
-                texts.append(final_text)
-    except wave.Error:
-        return None, "wav の読み込みに失敗しました。"
-    except Exception:
-        return None, "音声認識に失敗しました。"
-
-    recognized_text = " ".join(texts).strip()
-    if not recognized_text:
-        return None, "音声を認識できませんでした。"
-
-    return recognized_text, None
 
 
 def on_mic_button_click(mic_button: tk.Button, mic_state: dict, temp_files: set[str]) -> None:
-    if os.name != "nt":
-        messagebox.showinfo("録音", "録音機能は Windows のみ対応です。")
+    """録音ボタンの押下で録音開始 / 停止と文字起こし処理を行う。"""
+    if os.name != 'nt':
+        messagebox.showinfo('録音', '録音機能は Windows のみ対応です。')
         return
 
-    alias = mic_state["recording_alias"]
+    alias = mic_state['recording_alias']
 
-    if not mic_state["is_recording"]:
+    if not mic_state['is_recording']:
         _close_recorder_if_open(mic_state)
-        open_result = _mci_send(f"open new type waveaudio alias {alias}")
+        open_result = _mci_send(f'open new type waveaudio alias {alias}')
         if open_result != 0:
-            messagebox.showinfo("録音", "録音デバイスを開始できませんでした。")
+            messagebox.showinfo('録音失敗', '録音デバイスを開始できませんでした。')
             return
 
-        record_result = _mci_send(f"record {alias}")
+        record_result = _mci_send(f'record {alias}')
         if record_result != 0:
             _close_recorder_if_open(mic_state)
-            messagebox.showinfo("録音", "録音を開始できませんでした。")
+            messagebox.showinfo('録音失敗', '録音を開始できませんでした。')
             return
 
-        mic_state["is_recording"] = True
-        mic_button.configure(text="●録音中", fg="red")
+        mic_state['is_recording'] = True
+        mic_button.configure(text='●録音中', fg='red')
         return
 
-    audio_path = create_audio_temp_file_path()
-    stop_result = _mci_send(f"stop {alias}")
-    save_result = _mci_send(f'save {alias} "{audio_path}"')
+    wav_path = create_audio_temp_file_path()
+    mp3_path = create_mp3_temp_file_path_from_wav(wav_path)
+
+    stop_result = _mci_send(f'stop {alias}')
+    save_result = _mci_send(f'save {alias} "{wav_path}"')
     _close_recorder_if_open(mic_state)
 
-    if stop_result != 0 or save_result != 0:
-        messagebox.showinfo("録音", "録音ファイルの保存に失敗しました。")
-        mic_state["is_recording"] = False
-        mic_button.configure(text="🎤", fg="black")
+    mic_state['is_recording'] = False
+    mic_button.configure(text='変換中...', fg='black')
+
+    if stop_result != 0:
+        mic_button.configure(text='🎤', fg='black')
+        messagebox.showinfo('録音失敗', '録音の停止に失敗しました。')
         return
 
-    temp_files.add(audio_path)
-    mic_state["last_audio_path"] = audio_path
-    mic_state["is_recording"] = False
-
-    # 録音停止後に Vosk で文字起こし（第5段階: print + MessageBox まで）
-    mic_button.configure(text="変換中...", fg="black")
-    recognized_text, error_message = transcribe_wav_with_vosk(audio_path)
-    mic_button.configure(text="🎤", fg="black")
-
-    if error_message is not None:
-        messagebox.showinfo("音声認識", error_message)
+    if save_result != 0:
+        mic_button.configure(text='🎤', fg='black')
+        messagebox.showinfo('WAV保存失敗', '録音ファイルの保存に失敗しました。')
         return
 
-    print(recognized_text)
-    messagebox.showinfo("音声認識結果", recognized_text)
+    temp_files.add(wav_path)
+    mic_state['last_audio_path'] = wav_path
+    ffmpeg_path = find_ffmpeg_executable_path()
+    transcription_source_path = wav_path
+    mp3_conversion_message = None
+
+    if ffmpeg_path is not None:
+        try:
+            convert_wav_to_mp3(wav_path, mp3_path, ffmpeg_path)
+            temp_files.add(mp3_path)
+            transcription_source_path = mp3_path
+        except Exception as exc:
+            mp3_conversion_message = f'MP3変換失敗のため WAV を送信します。\n{exc}'
+    else:
+        mp3_conversion_message = 'ffmpeg が見つからないため WAV を送信します。'
+
+    try:
+        api_key = load_api_key_from_encrypted_files()
+    except Exception as exc:
+        mic_button.configure(text='🎤', fg='black')
+        messagebox.showinfo('APIキー復号失敗', f'OpenAI API キーの復号に失敗しました。\n{exc}')
+        return
+
+    try:
+        recognized_text = transcribe_audio_file(transcription_source_path, api_key)
+    except Exception as exc:
+        mic_button.configure(text='🎤', fg='black')
+        messagebox.showinfo('API送信失敗', f'音声の送信または文字起こしに失敗しました。\n{exc}')
+        return
+
+    try:
+        output_directory = os.path.dirname(wav_path)
+        saved_text_path = save_transcription_to_file(output_directory, recognized_text)
+    except Exception as exc:
+        mic_button.configure(text='🎤', fg='black')
+        messagebox.showinfo('保存失敗', f'文字起こし結果の保存に失敗しました。\n{exc}')
+        return
+
+    mic_button.configure(text='🎤', fg='black')
+    if mp3_conversion_message is not None:
+        messagebox.showinfo('MP3変換', mp3_conversion_message)
+    messagebox.showinfo(
+        '音声認識結果',
+        f'{recognized_text}\n\n保存先: {saved_text_path}',
+    )
+
+    try:
+        open_text_file_with_default_editor(saved_text_path)
+    except Exception as exc:
+        messagebox.showinfo('エディター起動失敗', f'保存したテキストファイルを開けませんでした。\n{exc}')
 
 
 def create_temp_file_path(extension: str) -> str:
