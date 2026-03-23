@@ -1,6 +1,7 @@
 import ctypes
 import io
 import os
+import shutil
 import subprocess
 import tempfile
 import tkinter as tk
@@ -66,6 +67,16 @@ def create_mp3_temp_file_path_from_wav(wav_path: str) -> str:
     return str(wav_obj.with_suffix('.mp3'))
 
 
+def find_ffmpeg_executable_path() -> str | None:
+    """同じフォルダー、次に PATH 上から ffmpeg 実行ファイルを探す。"""
+    script_dir = Path(__file__).resolve().parent
+    local_ffmpeg_path = script_dir / "ffmpeg.exe"
+    if local_ffmpeg_path.exists():
+        return str(local_ffmpeg_path)
+
+    return shutil.which("ffmpeg")
+
+
 def load_api_key_from_encrypted_files() -> str:
     """secret_key.bin と encrypted_key.bin から OpenAI API キーを復号する。"""
     script_dir = Path(__file__).resolve().parent
@@ -98,11 +109,11 @@ def load_api_key_from_encrypted_files() -> str:
     return cipher.decrypt(encrypted_token).decode('utf-8')
 
 
-def convert_wav_to_mp3(wav_path: str, mp3_path: str) -> None:
+def convert_wav_to_mp3(wav_path: str, mp3_path: str, ffmpeg_path: str) -> None:
     """ffmpeg を使って WAV を MP3 に変換する。"""
     subprocess.run(
         [
-            'ffmpeg',
+            ffmpeg_path,
             '-y',
             '-i',
             wav_path,
@@ -114,11 +125,11 @@ def convert_wav_to_mp3(wav_path: str, mp3_path: str) -> None:
     )
 
 
-def transcribe_mp3_file(mp3_path: str, api_key: str) -> str:
-    """MP3 ファイルを OpenAI API に送信して文字起こし結果を返す。"""
+def transcribe_audio_file(audio_file_path: str, api_key: str) -> str:
+    """音声ファイルを OpenAI API に送信して文字起こし結果を返す。"""
     client = OpenAI(api_key=api_key)
 
-    with open(mp3_path, 'rb') as audio_file:
+    with open(audio_file_path, 'rb') as audio_file:
         response = client.audio.transcriptions.create(
             model='gpt-4o-mini-transcribe',
             file=audio_file,
@@ -198,15 +209,19 @@ def on_mic_button_click(mic_button: tk.Button, mic_state: dict, temp_files: set[
 
     temp_files.add(wav_path)
     mic_state['last_audio_path'] = wav_path
+    ffmpeg_path = find_ffmpeg_executable_path()
+    transcription_source_path = wav_path
+    mp3_conversion_message = None
 
-    try:
-        convert_wav_to_mp3(wav_path, mp3_path)
-    except Exception as exc:
-        mic_button.configure(text='🎤', fg='black')
-        messagebox.showinfo('MP3変換失敗', f'WAV から MP3 への変換に失敗しました。\n{exc}')
-        return
-
-    temp_files.add(mp3_path)
+    if ffmpeg_path is not None:
+        try:
+            convert_wav_to_mp3(wav_path, mp3_path, ffmpeg_path)
+            temp_files.add(mp3_path)
+            transcription_source_path = mp3_path
+        except Exception as exc:
+            mp3_conversion_message = f'MP3変換失敗のため WAV を送信します。\n{exc}'
+    else:
+        mp3_conversion_message = 'ffmpeg が見つからないため WAV を送信します。'
 
     try:
         api_key = load_api_key_from_encrypted_files()
@@ -216,7 +231,7 @@ def on_mic_button_click(mic_button: tk.Button, mic_state: dict, temp_files: set[
         return
 
     try:
-        recognized_text = transcribe_mp3_file(mp3_path, api_key)
+        recognized_text = transcribe_audio_file(transcription_source_path, api_key)
     except Exception as exc:
         mic_button.configure(text='🎤', fg='black')
         messagebox.showinfo('API送信失敗', f'音声の送信または文字起こしに失敗しました。\n{exc}')
@@ -231,6 +246,8 @@ def on_mic_button_click(mic_button: tk.Button, mic_state: dict, temp_files: set[
         return
 
     mic_button.configure(text='🎤', fg='black')
+    if mp3_conversion_message is not None:
+        messagebox.showinfo('MP3変換', mp3_conversion_message)
     messagebox.showinfo(
         '音声認識結果',
         f'{recognized_text}\n\n保存先: {saved_text_path}',
