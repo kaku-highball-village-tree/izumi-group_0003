@@ -1,3 +1,5 @@
+import base64
+import csv
 import ctypes
 import io
 import os
@@ -28,6 +30,9 @@ except ImportError:
 
 MAX_API_FILE_SIZE = 10 * 1024 * 1024
 THUMBNAIL_SIZE = (400, 240)
+IMAGE_OCR_CONFIRM_TIMEOUT_MS = 10000
+IMAGE_OCR_MODEL = "gpt-4.1-mini"
+CUSTOMER_SEARCH_FILE_NAME = "customer_search.tsv"
 
 
 def open_original_temp_with_paint(current_image: dict) -> None:
@@ -156,6 +161,134 @@ def open_text_file_with_default_editor(file_path: str) -> None:
     os.startfile(file_path)
 
 
+def create_bom_temp_file_from_text_file(source_file_path: str, temp_files: set[str]) -> str:
+    """表示専用の BOM 付き temp ファイルを作成する。"""
+    source_path = Path(source_file_path)
+    bom_file_name = f"bom_temp_{source_path.name}"
+    bom_file_path = source_path.with_name(bom_file_name)
+
+    with open(source_file_path, "r", encoding="utf-8") as source_file:
+        content = source_file.read()
+
+    with open(bom_file_path, "w", encoding="utf-8-sig") as bom_file:
+        bom_file.write(content)
+
+    temp_files.add(str(bom_file_path))
+    return str(bom_file_path)
+
+
+def open_text_file_with_notepad_and_delete_after_close(file_path: str, temp_files: set[str]) -> None:
+    """メモ帳で開き、閉じられたら BOM 付き temp ファイルを削除する。"""
+    process = subprocess.Popen(["notepad.exe", file_path])
+    process.wait()
+
+    if file_path in temp_files:
+        temp_files.discard(file_path)
+
+    if os.path.exists(file_path):
+        os.remove(file_path)
+
+
+def save_image_ocr_to_file(target_directory_path: str, recognized_text: str) -> str:
+    """画像OCR結果を日時付きテキストファイルとして保存する。"""
+    timestamp = datetime.now().strftime('%Y_%m_%d_%H_%M_%S')
+    output_file_name = f'output_image_string_{timestamp}.txt'
+    output_file_path = os.path.join(target_directory_path, output_file_name)
+
+    with open(output_file_path, 'w', encoding='utf-8') as text_file:
+        text_file.write(recognized_text)
+        text_file.write('\n')
+
+    return output_file_path
+
+
+def _encode_image_file_as_data_url(image_file_path: str) -> str:
+    image_path = Path(image_file_path)
+    suffix = image_path.suffix.lower()
+    mime_type_map = {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".webp": "image/webp",
+        ".gif": "image/gif",
+    }
+    mime_type = mime_type_map.get(suffix, "application/octet-stream")
+
+    with open(image_file_path, "rb") as image_file:
+        encoded = base64.b64encode(image_file.read()).decode("ascii")
+
+    return f"data:{mime_type};base64,{encoded}"
+
+
+def extract_text_from_image_file(image_file_path: str, api_key: str) -> str:
+    """画像ファイルを OpenAI API に送信して OCR 結果文字列を返す。"""
+    client = OpenAI(api_key=api_key)
+    data_url = _encode_image_file_as_data_url(image_file_path)
+
+    response = client.responses.create(
+        model=IMAGE_OCR_MODEL,
+        input=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "画像内の文字をOCRしてください。読めた文字だけを自然な改行で返してください。",
+                    },
+                    {
+                        "type": "input_image",
+                        "image_url": data_url,
+                    },
+                ],
+            }
+        ],
+    )
+
+    return response.output_text.strip()
+
+
+def ask_image_ocr_confirmation(root: tk.Tk) -> str:
+    """画像OCRを実行するか確認し、yes/no/timeout を返す。"""
+    dialog = tk.Toplevel(root)
+    dialog.title("画像OCR確認")
+    dialog.transient(root)
+    dialog.grab_set()
+    dialog.resizable(False, False)
+
+    result = {"value": "timeout"}
+
+    frame = tk.Frame(dialog, padx=16, pady=16)
+    frame.pack()
+
+    tk.Label(
+        frame,
+        text="画像を ChatGPT に送って OCR を実行しますか？\nYes: 実行 / No: やり直し / 10秒放置: やり直し",
+        justify="left",
+    ).pack(pady=(0, 12))
+
+    button_row = tk.Frame(frame)
+    button_row.pack()
+
+    def close_dialog(value: str) -> None:
+        if dialog.winfo_exists():
+            result["value"] = value
+            dialog.destroy()
+
+    tk.Button(button_row, text="Yes", width=10, command=lambda: close_dialog("yes")).pack(side="left", padx=4)
+    tk.Button(button_row, text="No", width=10, command=lambda: close_dialog("no")).pack(side="left", padx=4)
+
+    dialog.protocol("WM_DELETE_WINDOW", lambda: close_dialog("no"))
+    dialog.after(IMAGE_OCR_CONFIRM_TIMEOUT_MS, lambda: close_dialog("timeout"))
+
+    dialog.update_idletasks()
+    pos_x = root.winfo_rootx() + max(0, (root.winfo_width() - dialog.winfo_width()) // 2)
+    pos_y = root.winfo_rooty() + max(0, (root.winfo_height() - dialog.winfo_height()) // 2)
+    dialog.geometry(f"+{pos_x}+{pos_y}")
+
+    root.wait_window(dialog)
+    return result["value"]
+
+
 def _mci_send(command: str) -> int:
     return ctypes.windll.winmm.mciSendStringW(command, None, 0, None)
 
@@ -259,7 +392,8 @@ def on_mic_button_click(mic_button: tk.Button, mic_state: dict, temp_files: set[
     )
 
     try:
-        open_text_file_with_default_editor(saved_text_path)
+        bom_temp_file_path = create_bom_temp_file_from_text_file(saved_text_path, temp_files)
+        open_text_file_with_notepad_and_delete_after_close(bom_temp_file_path, temp_files)
     except Exception as exc:
         messagebox.showinfo('エディター起動失敗', f'保存したテキストファイルを開けませんでした。\n{exc}')
 
@@ -386,8 +520,61 @@ def clear_thumbnail(
     )
 
 
+def run_image_ocr_flow(
+    root: tk.Tk,
+    image_label: tk.Label,
+    close_button: tk.Button,
+    state: dict,
+    current_image: dict,
+    history: dict,
+    temp_files: set[str],
+) -> None:
+    """現在の画像に対する OCR 実行可否を確認し、必要なら OCR を実行する。"""
+    confirm_result = ask_image_ocr_confirmation(root)
+    if confirm_result != "yes":
+        clear_thumbnail(image_label, close_button, state, current_image, history)
+        if confirm_result == "timeout":
+            messagebox.showinfo("画像OCR", "一定時間応答がなかったため、画像をクリアしました。")
+        return
+
+    api_send_path = current_image.get("api_send_path")
+    if not api_send_path:
+        messagebox.showinfo("画像OCR", "OCR に使用できる画像がありません。")
+        return
+
+    try:
+        api_key = load_api_key_from_encrypted_files()
+    except Exception as exc:
+        messagebox.showinfo("APIキー復号失敗", f"OpenAI API キーの復号に失敗しました。\n{exc}")
+        return
+
+    try:
+        recognized_text = extract_text_from_image_file(api_send_path, api_key)
+    except Exception as exc:
+        messagebox.showinfo("画像OCR失敗", f"画像の OCR に失敗しました。\n{exc}")
+        return
+
+    try:
+        saved_text_path = save_image_ocr_to_file(os.path.dirname(api_send_path), recognized_text)
+    except Exception as exc:
+        messagebox.showinfo("保存失敗", f"画像OCR結果の保存に失敗しました。\n{exc}")
+        return
+
+    messagebox.showinfo(
+        "画像OCR結果",
+        f"{recognized_text}\n\n保存先: {saved_text_path}",
+    )
+
+    try:
+        bom_temp_file_path = create_bom_temp_file_from_text_file(saved_text_path, temp_files)
+        open_text_file_with_notepad_and_delete_after_close(bom_temp_file_path, temp_files)
+    except Exception as exc:
+        messagebox.showinfo("エディター起動失敗", f"保存したテキストファイルを開けませんでした。\n{exc}")
+
+
 def handle_paste_image(
     event: tk.Event,
+    root: tk.Tk,
     image_label: tk.Label,
     close_button: tk.Button,
     state: dict,
@@ -420,6 +607,15 @@ def handle_paste_image(
             close_button,
             state,
             current_image,
+        )
+        run_image_ocr_flow(
+            root,
+            image_label,
+            close_button,
+            state,
+            current_image,
+            history,
+            temp_files,
         )
         return "break"
 
@@ -472,6 +668,15 @@ def handle_drop_image_file(
         state,
         current_image,
     )
+    run_image_ocr_flow(
+        root,
+        image_label,
+        close_button,
+        state,
+        current_image,
+        history,
+        temp_files,
+    )
     return "break"
 
 
@@ -509,6 +714,178 @@ def redo_thumbnail(
     return "break"
 
 
+def _normalize_search_text(text: str) -> str:
+    return " ".join(text.strip().lower().split())
+
+
+def load_customer_search_master() -> list[dict]:
+    script_dir = Path(__file__).resolve().parent
+    file_path = script_dir / CUSTOMER_SEARCH_FILE_NAME
+    if not file_path.exists():
+        raise FileNotFoundError(f"{CUSTOMER_SEARCH_FILE_NAME} が見つかりません。")
+
+    required_headers = {
+        "customer_id",
+        "customer_name",
+        "customer_name_hiragana",
+        "customer_name_katakana",
+        "customer_name_katakana_half",
+        "customer_name_english",
+        "customer_name_romaji",
+        "customer_name_unique_prefix",
+    }
+
+    records: list[dict] = []
+    with open(file_path, "r", encoding="utf-8-sig", newline="") as tsv_file:
+        reader = csv.DictReader(tsv_file, delimiter="\t")
+        if reader.fieldnames is None:
+            raise ValueError("customer_search.tsv のヘッダーが見つかりません。")
+
+        missing_headers = sorted(required_headers - set(reader.fieldnames))
+        if missing_headers:
+            missing = ", ".join(missing_headers)
+            raise ValueError(f"customer_search.tsv の列が不足しています: {missing}")
+
+        for row in reader:
+            customer_id = (row.get("customer_id") or "").strip()
+            customer_name = (row.get("customer_name") or "").strip()
+            if not customer_id or not customer_name:
+                continue
+
+            search_tokens = []
+            for column_name in [
+                "customer_name",
+                "customer_name_hiragana",
+                "customer_name_katakana",
+                "customer_name_katakana_half",
+                "customer_name_english",
+                "customer_name_romaji",
+            ]:
+                normalized = _normalize_search_text(row.get(column_name) or "")
+                if normalized:
+                    search_tokens.append(normalized)
+
+            unique_prefix = _normalize_search_text(row.get("customer_name_unique_prefix") or "")
+            records.append(
+                {
+                    "customer_id": customer_id,
+                    "display_name": customer_name,
+                    "search_tokens": search_tokens,
+                    "unique_prefix": unique_prefix,
+                }
+            )
+
+    return records
+
+
+def find_customer_candidates(query: str, customer_records: list[dict]) -> tuple[list[dict], list[dict]]:
+    normalized_query = _normalize_search_text(query)
+    if not normalized_query:
+        return [], []
+
+    unique_matches: list[dict] = []
+    scored: list[tuple[int, int, dict]] = []
+    for index, record in enumerate(customer_records):
+        unique_prefix = record["unique_prefix"]
+        if unique_prefix and normalized_query == unique_prefix:
+            unique_matches.append(record)
+
+        best_score = 0
+        for token in record["search_tokens"]:
+            if token.startswith(normalized_query):
+                best_score = max(best_score, 200)
+            elif normalized_query in token:
+                best_score = max(best_score, 100)
+
+        if best_score > 0:
+            scored.append((best_score, index, record))
+
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return unique_matches, [item[2] for item in scored]
+
+
+def _set_customer_entry_value(entry: tk.Entry, selected_customer_state: dict, record: dict) -> None:
+    entry.delete(0, tk.END)
+    entry.insert(0, record["display_name"])
+    selected_customer_state["customer_id"] = record["customer_id"]
+    selected_customer_state["customer_name"] = record["display_name"]
+
+
+def _clear_candidate_list(candidate_listbox: tk.Listbox, selected_customer_state: dict) -> None:
+    candidate_listbox.delete(0, tk.END)
+    candidate_listbox.pack_forget()
+    selected_customer_state["candidates"] = []
+
+
+def update_customer_candidates(
+    entry: tk.Entry,
+    candidate_listbox: tk.Listbox,
+    customer_records: list[dict],
+    selected_customer_state: dict,
+) -> None:
+    query = entry.get()
+    unique_matches, candidates = find_customer_candidates(query, customer_records)
+
+    if not _normalize_search_text(query):
+        _clear_candidate_list(candidate_listbox, selected_customer_state)
+        return
+
+    if len(unique_matches) == 1:
+        _set_customer_entry_value(entry, selected_customer_state, unique_matches[0])
+        _clear_candidate_list(candidate_listbox, selected_customer_state)
+        return
+
+    if len(candidates) == 1:
+        _set_customer_entry_value(entry, selected_customer_state, candidates[0])
+        _clear_candidate_list(candidate_listbox, selected_customer_state)
+        return
+
+    if not candidates:
+        _clear_candidate_list(candidate_listbox, selected_customer_state)
+        return
+
+    selected_customer_state["candidates"] = candidates[:8]
+    candidate_listbox.delete(0, tk.END)
+    for candidate in selected_customer_state["candidates"]:
+        candidate_listbox.insert(tk.END, candidate["display_name"])
+    candidate_listbox.pack(fill="x", pady=(4, 0))
+
+
+def confirm_selected_candidate(
+    entry: tk.Entry,
+    candidate_listbox: tk.Listbox,
+    selected_customer_state: dict,
+) -> str:
+    if not selected_customer_state["candidates"]:
+        return "break"
+
+    selection = candidate_listbox.curselection()
+    if not selection:
+        return "break"
+
+    record = selected_customer_state["candidates"][selection[0]]
+    _set_customer_entry_value(entry, selected_customer_state, record)
+    _clear_candidate_list(candidate_listbox, selected_customer_state)
+    entry.focus_set()
+    return "break"
+
+
+def move_candidate_selection_down(event: tk.Event, candidate_listbox: tk.Listbox, selected_customer_state: dict) -> str:
+    if not selected_customer_state["candidates"]:
+        return "break"
+
+    candidate_listbox.focus_set()
+    if not candidate_listbox.curselection():
+        candidate_listbox.selection_set(0)
+        candidate_listbox.activate(0)
+    return "break"
+
+
+def hide_candidates_on_escape(event: tk.Event, candidate_listbox: tk.Listbox, selected_customer_state: dict) -> str:
+    _clear_candidate_list(candidate_listbox, selected_customer_state)
+    return "break"
+
+
 def cleanup_temp_files(root: tk.Tk, temp_files: set[str], mic_state: dict) -> None:
     if os.name == "nt" and mic_state.get("is_recording"):
         _close_recorder_if_open(mic_state)
@@ -528,7 +905,7 @@ def main() -> None:
     else:
         root = tk.Tk()
 
-    root.title("tkinter / ttk Button Sample 0012")
+    root.title("tkinter / ttk Button Sample 0014")
 
     screen_width = root.winfo_screenwidth()
     screen_height = root.winfo_screenheight()
@@ -582,6 +959,14 @@ def main() -> None:
 
     entry = tk.Entry(entry_row, width=40)
     entry.pack(side="left")
+    customer_records: list[dict] = []
+    selected_customer_state = {"customer_id": None, "customer_name": None, "candidates": []}
+    try:
+        customer_records = load_customer_search_master()
+    except Exception as exc:
+        messagebox.showinfo("顧客候補", f"customer_search.tsv の読み込みに失敗しました。\n{exc}")
+
+    candidate_listbox = tk.Listbox(frame, height=8)
 
     mic_state = {"is_recording": False, "recording_alias": "recsound", "last_audio_path": None}
 
@@ -612,6 +997,7 @@ def main() -> None:
         "<Control-v>",
         lambda event: handle_paste_image(
             event,
+            root,
             image_label,
             close_button,
             state,
@@ -624,6 +1010,7 @@ def main() -> None:
         "<Control-V>",
         lambda event: handle_paste_image(
             event,
+            root,
             image_label,
             close_button,
             state,
@@ -685,6 +1072,47 @@ def main() -> None:
             state,
             current_image,
             history,
+        ),
+    )
+    entry.bind(
+        "<KeyRelease>",
+        lambda event: update_customer_candidates(
+            entry,
+            candidate_listbox,
+            customer_records,
+            selected_customer_state,
+        ),
+    )
+    entry.bind(
+        "<Down>",
+        lambda event: move_candidate_selection_down(
+            event,
+            candidate_listbox,
+            selected_customer_state,
+        ),
+    )
+    entry.bind(
+        "<Escape>",
+        lambda event: hide_candidates_on_escape(
+            event,
+            candidate_listbox,
+            selected_customer_state,
+        ),
+    )
+    candidate_listbox.bind(
+        "<ButtonRelease-1>",
+        lambda event: confirm_selected_candidate(
+            entry,
+            candidate_listbox,
+            selected_customer_state,
+        ),
+    )
+    candidate_listbox.bind(
+        "<Return>",
+        lambda event: confirm_selected_candidate(
+            entry,
+            candidate_listbox,
+            selected_customer_state,
         ),
     )
 
