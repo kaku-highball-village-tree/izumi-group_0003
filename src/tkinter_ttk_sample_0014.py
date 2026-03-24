@@ -11,8 +11,10 @@ from datetime import datetime
 from pathlib import Path
 from tkinter import messagebox, ttk
 
+import cv2
 from cryptography.fernet import Fernet
 from openai import OpenAI
+from pyzbar import pyzbar
 
 try:
     from PIL import Image, ImageGrab, ImageTk
@@ -33,6 +35,7 @@ THUMBNAIL_SIZE = (400, 240)
 IMAGE_OCR_CONFIRM_TIMEOUT_MS = 10000
 IMAGE_OCR_MODEL = "gpt-4.1-mini"
 CUSTOMER_SEARCH_FILE_NAME = "customer_search.tsv"
+QR_SCAN_DUPLICATE_INTERVAL_SECONDS = 2
 
 
 def open_original_temp_with_paint(current_image: dict) -> None:
@@ -886,6 +889,91 @@ def hide_candidates_on_escape(event: tk.Event, candidate_listbox: tk.Listbox, se
     return "break"
 
 
+def decode_qr_bytes_auto(raw_data: bytes) -> str | None:
+    try:
+        return raw_data.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+
+    try:
+        return raw_data.decode("cp932")
+    except UnicodeDecodeError:
+        return None
+
+
+def write_qr_single_file_and_open(decoded_text: str) -> None:
+    script_dir = Path(__file__).resolve().parent
+    file_name = datetime.now().strftime("qr_contents_%Y年%m月%d日_%H時%M分%S秒.txt")
+    file_path = script_dir / file_name
+
+    with open(file_path, "w", encoding="utf-8") as text_file:
+        text_file.write(decoded_text)
+        text_file.write("\n")
+
+    try:
+        os.startfile(str(file_path))
+    except Exception as exc:
+        messagebox.showinfo("エディター起動失敗", f"保存したテキストファイルを開けませんでした。\n{exc}")
+
+
+def run_qr_camera_loop() -> None:
+    capture = cv2.VideoCapture(0)
+    if not capture.isOpened():
+        messagebox.showinfo("QRスキャン", "カメラを起動できませんでした。")
+        return
+
+    window_name = "QR Scan"
+    last_decoded_text = ""
+    last_processed_time: datetime | None = None
+    frame_read_error_shown = False
+
+    try:
+        while True:
+            is_ok, frame = capture.read()
+            if not is_ok:
+                if not frame_read_error_shown:
+                    messagebox.showinfo("QRスキャン", "カメラフレームの取得に失敗しました。")
+                    frame_read_error_shown = True
+                break
+
+            codes = pyzbar.decode(frame)
+            for code in codes:
+                decoded_text = decode_qr_bytes_auto(code.data)
+                if decoded_text is None:
+                    continue
+
+                now = datetime.now()
+                should_process = False
+                if decoded_text != last_decoded_text:
+                    should_process = True
+                elif last_processed_time is None:
+                    should_process = True
+                else:
+                    diff_seconds = (now - last_processed_time).total_seconds()
+                    if diff_seconds >= QR_SCAN_DUPLICATE_INTERVAL_SECONDS:
+                        should_process = True
+
+                if should_process:
+                    try:
+                        write_qr_single_file_and_open(decoded_text)
+                    except Exception as exc:
+                        messagebox.showinfo("保存失敗", f"QR 内容の保存に失敗しました。\n{exc}")
+                    last_decoded_text = decoded_text
+                    last_processed_time = now
+
+            cv2.imshow(window_name, frame)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
+                break
+    finally:
+        capture.release()
+        cv2.destroyAllWindows()
+
+
+def start_qr_scan() -> None:
+    run_qr_camera_loop()
+
+
 def cleanup_temp_files(root: tk.Tk, temp_files: set[str], mic_state: dict) -> None:
     if os.name == "nt" and mic_state.get("is_recording"):
         _close_recorder_if_open(mic_state)
@@ -1120,8 +1208,8 @@ def main() -> None:
 
     tk_button = tk.Button(
         frame,
-        text="tkinter.Button",
-        command=lambda: open_original_temp_with_paint(current_image),
+        text="QRスキャン",
+        command=start_qr_scan,
     )
     tk_button.pack(pady=(0, 12))
 
