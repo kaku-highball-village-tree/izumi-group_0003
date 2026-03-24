@@ -923,6 +923,18 @@ def run_qr_camera_loop() -> None:
         return
 
     window_name = "QR Scan"
+    exit_keys = {
+        ord("e"),
+        ord("q"),
+        ord("l"),
+        ord("b"),
+        ord("c"),
+        ord("s"),
+        ord("f"),
+        ord("h"),
+        ord("t"),
+        27,  # ESC
+    }
     last_decoded_text = ""
     last_processed_time: datetime | None = None
     frame_read_error_shown = False
@@ -963,7 +975,7 @@ def run_qr_camera_loop() -> None:
 
             cv2.imshow(window_name, frame)
             key = cv2.waitKey(1) & 0xFF
-            if key == ord("q"):
+            if key in exit_keys:
                 break
     finally:
         capture.release()
